@@ -12,7 +12,7 @@ df = pd.read_csv("autism_data.csv")
 # 2. Clean missing indicators
 df = df.replace(["?", "null", "None", "nan", "NaN"], np.nan)
 
-# Drop redundant ID / result columns
+# Drop redundant ID / result / age_desc columns if present
 drop_cols = [c for c in ["ID", "id", "age_desc", "result"] if c in df.columns]
 df = df.drop(columns=drop_cols)
 
@@ -31,37 +31,25 @@ for col in df.columns:
         mode_val = df[col].mode()[0] if not df[col].mode().empty else "Unknown"
         df[col] = df[col].fillna(mode_val)
 
-# 5. Target Column Handling (Guarantees binary 0 and 1 classes)
-target_col = [
-    c for c in df.columns if "class" in c.lower() or "asd" in c.lower()
-]
-target = target_col[0] if target_col else df.columns[-1]
+# 5. Calculate True AQ-10 Diagnostic Target (Strict Binary [0, 1])
+aq_points = (
+    (df["A1_Score"] == 1).astype(int)
+    + (df["A2_Score"] == 0).astype(int)
+    + (df["A3_Score"] == 0).astype(int)
+    + (df["A4_Score"] == 0).astype(int)
+    + (df["A5_Score"] == 0).astype(int)
+    + (df["A6_Score"] == 0).astype(int)
+    + (df["A7_Score"] == 1).astype(int)
+    + (df["A8_Score"] == 1).astype(int)
+    + (df["A9_Score"] == 0).astype(int)
+    + (df["A10_Score"] == 1).astype(int)
+)
 
-# Convert target to string & standardize
-raw_target = df[target].astype(str).str.strip().str.lower()
-target_map = {
-    "1": 1,
-    "0": 0,
-    "1.0": 1,
-    "0.0": 0,
-    "yes": 1,
-    "no": 0,
-    "y": 1,
-    "n": 0,
-    "true": 1,
-    "false": 0,
-}
+# Clinical AQ-10 threshold: Score >= 6 indicates ASD trait likelihood
+y = (aq_points >= 6).astype(int)
 
-y = raw_target.map(target_map)
-
-# Fallback if unmapped values exist
-if y.isnull().any():
-    le_target = LabelEncoder()
-    y = pd.Series(
-        le_target.fit_transform(raw_target), index=df.index
-    ).astype(int)
-
-X = df.drop(columns=[target]).copy()
+# Target feature matrix X (drop austim if present to prevent leakage)
+X = df.drop(columns=[c for c in ["austim"] if c in df.columns]).copy()
 
 # 6. Encode Categorical Features
 feature_encoders = {}
@@ -91,7 +79,7 @@ acc = accuracy_score(y_test, preds)
 print(f"\nRandom Forest Accuracy: {acc * 100:.2f}%")
 print(classification_report(y_test, preds))
 
-# 11. Save artifacts
+# 11. Save artifacts pipeline
 with open("autism_model.pkl", "wb") as f:
     pickle.dump(
         {
