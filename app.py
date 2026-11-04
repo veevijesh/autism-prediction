@@ -2,41 +2,53 @@ import pickle
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
+import shap
 
 st.set_page_config(
-    page_title="Autism Spectrum Screening Tool",
+    page_title="Explainable Autism Spectrum Screening Tool",
     page_icon="🧠",
     layout="wide",
 )
 
-st.title("🧠 Autism Spectrum Trait Screening Tool")
+st.title("🧠 Explainable ML Autism Trait Screening System")
 st.write(
-    "An ML-powered preliminary screening application based on the AQ-10 behavioral assessment."
+    "An advanced clinical decision support tool using Random Forest classification and SHAP (SHapley Additive exPlanations)."
 )
-
 st.info(
-    "⚠️ Disclaimer: Educational and screening purposes only. Does not replace clinical diagnosis."
+    "⚠️ Disclaimer: Educational and preliminary screening purposes only. Does not replace clinical medical diagnosis."
 )
 
-
-# Load saved model pipeline
 @st.cache_resource
 def load_pipeline():
     with open("autism_model.pkl", "rb") as f:
         return pickle.load(f)
 
-
 pipeline = load_pipeline()
 model = pipeline["model"]
 scaler = pipeline["scaler"]
 feature_names = pipeline["feature_names"]
-feature_encoders = pipeline["feature_encoders"]
-classes = pipeline.get("classes", [0, 1])
+category_maps = pipeline["category_maps"]
 
-# Create Tabs for FYP Presentation
-tab1, tab2 = st.tabs(["📋 Screening Questionnaire", "📊 Model Analytics & Insights"])
+@st.cache_resource
+def get_explainer():
+    return shap.TreeExplainer(model)
 
-# --- TAB 1: SCREENING TOOL ---
+explainer = get_explainer()
+
+# Session state initialization
+if "evaluated" not in st.session_state:
+    st.session_state["evaluated"] = False
+if "user_inputs" not in st.session_state:
+    st.session_state["user_inputs"] = {}
+
+tab1, tab2, tab3 = st.tabs([
+    "📋 Patient Assessment", 
+    "🔍 Explainable AI (XAI) Diagnosis", 
+    "📊 Dataset & Model Analytics"
+])
+
+# --- TAB 1: QUESTIONNAIRE ---
 with tab1:
     aq10_questions = {
         "A1_Score": "A1. Do you easily notice small sounds or details that others miss?",
@@ -51,113 +63,117 @@ with tab1:
         "A10_Score": "A10. Do you find it difficult to make new friends?",
     }
 
-    demographic_labels = {
-        "gender": "Gender",
-        "ethnicity": "Ethnicity / Race",
-        "jaundice": "Born with Jaundice (Yellowing of skin/eyes at birth)?",
-        "austim": "Family History of Autism Spectrum Disorder (ASD)?",
-        "contry_of_res": "Country of Residence",
-        "used_app_before": "Have you used this screening application before?",
-        "relation": "Who is completing this assessment?",
-        "age": "Age (in years)",
-    }
+    # AQ-10 Clinical Scoring Standard:
+    # "Yes" indicates trait for A1, A7, A8, A10
+    # "No" indicates trait (reverse-scored) for A2, A3, A4, A5, A6, A9
+    yes_is_trait = ["A1_Score", "A7_Score", "A8_Score", "A10_Score"]
 
-    value_display_mappings = {
-        "gender": {"f": "Female", "m": "Male"},
-        "jaundice": {"yes": "Yes", "no": "No"},
-        "austim": {"yes": "Yes", "no": "No"},
-        "used_app_before": {"yes": "Yes", "no": "No"},
-    }
-
-    st.subheader("1. AQ-10 Behavioral Screening Questionnaire")
+    st.subheader("1. Behavioral Diagnostic Indicators (AQ-10)")
     user_inputs = {}
 
-    for col in feature_names:
-        if col in aq10_questions:
-            choice = st.selectbox(
-                aq10_questions[col], options=["No (0)", "Yes (1)"]
+    col_a, col_b = st.columns(2)
+    for idx, (col, q_text) in enumerate(aq10_questions.items()):
+        if col in feature_names:
+            target_container = col_a if idx % 2 == 0 else col_b
+            choice = target_container.selectbox(
+                q_text, options=["No", "Yes"], key=col
             )
-            user_inputs[col] = 1 if choice == "Yes (1)" else 0
+            
+            # Apply clinical scoring key (1 = Trait Present, 0 = Trait Absent)
+            if col in yes_is_trait:
+                user_inputs[col] = 1 if choice == "Yes" else 0
+            else:
+                user_inputs[col] = 1 if choice == "No" else 0
 
     st.markdown("---")
-    st.subheader("2. Participant Demographic Information")
+    st.subheader("2. Demographic & Medical Background")
 
-    for col in feature_names:
-        if col not in aq10_questions:
-            label = demographic_labels.get(col, col.replace("_", " ").title())
+    demographics = {
+        "age": st.number_input("Age (Years)", min_value=0, max_value=100, value=25, key="age"),
+        "gender": st.selectbox("Gender", options=["Female", "Male"], key="gender"),
+        "ethnicity": st.selectbox("Ethnicity / Race", options=["Asian", "White-European", "Middle Eastern", "Black", "Others"], key="ethnicity"),
+        "jaundice": st.selectbox("Born with Jaundice?", options=["No", "Yes"], key="jaundice"),
+        "austim": st.selectbox("Family History of ASD?", options=["No", "Yes"], key="austim"),
+        "contry_of_res": st.selectbox("Country of Residence", options=["United Kingdom", "United States", "India", "Others"], key="contry_of_res"),
+        "used_app_before": st.selectbox("Used Screening App Before?", options=["No", "Yes"], key="used_app_before"),
+        "relation": st.selectbox("Assessment completed by", options=["Self", "Parent", "Relative", "Others"], key="relation"),
+    }
 
-            if col in feature_encoders:
-                raw_classes = list(feature_encoders[col].classes_)
-                mapping = value_display_mappings.get(col, {})
-                display_options = [mapping.get(c, str(c).title()) for c in raw_classes]
-                option_map = dict(zip(display_options, raw_classes))
-
-                selected_display = st.selectbox(label, display_options)
-                raw_val = option_map[selected_display]
-
-                user_inputs[col] = int(
-                    feature_encoders[col].transform([raw_val])[0]
-                )
+    for demo_col, val in demographics.items():
+        if demo_col in feature_names:
+            if demo_col == "age":
+                user_inputs[demo_col] = float(val)
             else:
-                val = st.number_input(
-                    label, min_value=0, max_value=100, value=25
-                )
-                user_inputs[col] = val
+                str_val = str(val).strip().lower()
+                mapping = category_maps.get(demo_col, {})
+                user_inputs[demo_col] = mapping.get(str_val, 0)
 
-    if st.button("Predict ASD Trait Likelihood", type="primary"):
-        input_df = pd.DataFrame([user_inputs])[feature_names]
+    predict_btn = st.button("Generate Diagnostic Risk Assessment", type="primary")
+
+    if predict_btn:
+        st.session_state["evaluated"] = True
+        st.session_state["user_inputs"] = user_inputs
+        st.success("✅ Assessment submitted! Switch to the **Explainable AI Diagnosis** tab to view results.")
+
+# --- TAB 2: EXPLAINABLE AI DIAGNOSIS ---
+with tab2:
+    if st.session_state.get("evaluated", False):
+        inputs = st.session_state["user_inputs"]
+        input_df = pd.DataFrame([inputs])[feature_names]
         input_scaled = scaler.transform(input_df)
 
-        prediction = int(model.predict(input_scaled)[0])
+        # Get exact class 1 probability
+        probs = model.predict_proba(input_scaled)[0]
+        prob_asd = probs[1] * 100
 
-        if hasattr(model, "predict_proba"):
-            probs = model.predict_proba(input_scaled)[0]
-            if 1 in classes and len(probs) > list(classes).index(1):
-                prob_asd = probs[list(classes).index(1)] * 100
-            else:
-                prob_asd = probs[-1] * 100
+        prediction = 1 if prob_asd >= 45.0 else 0
+
+        st.subheader("Diagnostic Risk Output")
+        if prediction == 1:
+            st.error(f"⚠️ **High ASD Trait Likelihood Detected** (Risk Score: {prob_asd:.1f}%)")
+            st.write("The ML model detected significant behavioral pattern alignment with autism spectrum trait indicators.")
         else:
-            prob_asd = 100.0 if prediction == 1 else 0.0
+            st.success(f"✅ **Low ASD Trait Likelihood Detected** (Risk Score: {prob_asd:.1f}%)")
+            st.write("The model did not identify significant behavioral patterns aligned with autism spectrum indicators.")
 
         st.markdown("---")
-        if prediction == 1:
-            st.error(
-                f"**High Likelihood of ASD Traits** (Probability Score: {prob_asd:.1f}%)"
-            )
-            st.write(
-                "The model identified behavioral responses consistent with autism spectrum trait indicators."
-            )
+        st.subheader("🔍 Local Explainability (SHAP Contribution Analysis)")
+
+        # Compute SHAP values safely across SHAP library versions
+        raw_shap = explainer(input_scaled)
+        
+        # Handle SHAP dimensionality variations (2D/3D arrays)
+        if isinstance(raw_shap.values, list):
+            vals_array = raw_shap.values[1][0]
+            base_val = raw_shap.base_values[1][0]
+        elif len(raw_shap.values.shape) == 3:
+            vals_array = raw_shap.values[0, :, 1]
+            base_val = raw_shap.base_values[0, 1]
         else:
-            st.success(
-                f"**Low Likelihood of ASD Traits** (Probability Score: {prob_asd:.1f}%)"
-            )
-            st.write(
-                "The model did not identify significant behavioral patterns aligned with autism spectrum indicators."
-            )
+            vals_array = raw_shap.values[0]
+            base_val = raw_shap.base_values[0]
 
-# --- TAB 2: MODEL PERFORMANCE FOR FYP PRESENTATION ---
-with tab2:
-    st.subheader("📊 Machine Learning Model Analytics")
-    st.write(
-        "This section highlights the trained Random Forest Classifier pipeline features and importance metrics."
-    )
+        shap_exp = shap.Explanation(
+            values=vals_array,
+            base_values=base_val,
+            data=input_df.iloc[0].values,
+            feature_names=feature_names
+        )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(label="Model Architecture", value="Random Forest Classifier")
-        st.metric(label="Ensemble Estimators", value="100 Decision Trees")
-    with col2:
-        st.metric(label="Scaling Standardizer", value="StandardScaler (Z-Score)")
-        st.metric(label="Total Features Analyzed", value=len(feature_names))
+        fig, ax = plt.subplots(figsize=(10, 5))
+        shap.plots.bar(shap_exp, show=False)
+        st.pyplot(fig)
+        plt.close(fig)
+    else:
+        st.info("Please fill in the assessment in Tab 1 and click **Generate Diagnostic Risk Assessment**.")
 
-    st.markdown("---")
-    st.subheader("🌲 Feature Importance Breakdown")
-    st.caption("Shows which survey questions contributed most heavily to the model's predictions.")
-
+# --- TAB 3: MODEL ANALYTICS ---
+with tab3:
+    st.subheader("📊 Model Performance & Global Feature Importance")
     importances = model.feature_importances_
     feat_df = pd.DataFrame(
-        {"Feature Name": feature_names, "Importance Score": importances}
+        {"Feature": feature_names, "Importance Score": importances}
     ).sort_values("Importance Score", ascending=False)
 
-    st.bar_chart(feat_df.set_index("Feature Name"))
+    st.bar_chart(feat_df.set_index("Feature"))
     st.dataframe(feat_df, use_container_width=True)
