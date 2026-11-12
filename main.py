@@ -1,109 +1,122 @@
+"""Train with: python main.py (adult questionnaire CSV, pre-scored by default)."""
+import argparse
 import pickle
-import numpy as np
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 
-# 1. Load Data
-df = pd.read_csv("autism_data.csv")
-df = df.replace(["?", "null", "None", "nan", "NaN"], np.nan)
+ROOT = Path(__file__).resolve().parent
+MODEL_PATH = ROOT / "autism_model.pkl"
+VERSION = "adult-items-only-v2"
 
-# Target Column Identification
-target_col = None
-for col in ["Class/ASD", "Class/ASD Traits", "austim", "class"]:
-    if col in df.columns:
-        target_col = col
-        break
-
-if target_col is None:
-    raise ValueError("Target column not found in dataset.")
-
-# Drop unneeded ID columns
-drop_cols = [c for c in ["ID", "id", "age_desc", "result"] if c in df.columns]
-df = df.drop(columns=drop_cols)
-
-# Separate Target y (1 = positive ASD, 0 = negative)
-y_raw = df[target_col].astype(str).str.strip().str.lower()
-y = y_raw.isin(["1", "yes", "true", "y"]).astype(int)
-X = df.drop(columns=[target_col]).copy()
-
-# Binary Mapping Helper
-binary_map = {"yes": 1, "no": 0, "y": 1, "n": 0, "1": 1, "0": 0, "f": 0, "m": 1}
-
-# Clean Numeric Features First
-for col in X.columns:
-    if "A" in col and "_Score" in col:
-        X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0).astype(int)
-    elif col == "age":
-        X[col] = pd.to_numeric(X[col], errors="coerce")
-
-# Train/Test Split BEFORE target-encoding categorical variables to prevent leakage
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
+# Adult AQ-10 key. Yes represents agreement, No represents disagreement.
+# A True entry awards one point for Yes, a False entry awards one for No.
+ITEMS = (
+    ("Do small sounds often catch your attention when others miss them?", True),
+    ("Do you usually concentrate more on the whole picture than on small details?", False),
+    ("Do you find it easy to do more than one task at the same time?", False),
+    ("After an interruption, can you quickly switch back to what you were doing?", False),
+    ("Do you find it easy to read between the lines when someone is talking?", False),
+    ("Can you tell when someone listening to you is getting bored?", False),
+    ("When reading a story, do you find it difficult to work out characters' intentions?", True),
+    ("Do you like collecting information about categories of things?", True),
+    ("Can you easily tell what someone is thinking or feeling by looking at their face?", False),
+    ("Do you find it difficult to work out what other people intend?", True),
 )
+SCORES = [f"A{i}_Score" for i in range(1, 11)]
+FIELDS = {
+    "gender": "Gender", "ethnicity": "Ethnicity", "jaundice": "Born with jaundice?",
+    "austim": "Family history of autism?", "contry_of_res": "Country of residence",
+    "used_app_before": "Previously used a screening app?", "relation": "Completed by",
+}
+ALIASES = {"jundice": "jaundice", "family_pdd": "austim", "country_of_res": "contry_of_res"}
+BINARY = {"yes": 1, "y": 1, "true": 1, "no": 0, "n": 0, "false": 0}
 
-# Impute median age calculated strictly from X_train
-age_median = X_train["age"].median()
-X_train["age"] = X_train["age"].fillna(age_median)
-X_test["age"] = X_test["age"].fillna(age_median)
 
-# Explicit Categorical Encoding (learned on Train, applied to Test)
-category_maps = {}
-for col in X_train.columns:
-    if col in ["age"] or ("A" in col and "_Score" in col):
-        continue
+def point(item_index, yes):
+    return int(yes == ITEMS[item_index][1])
 
-    # Fill NaN with 'unknown' and convert to string to prevent float vs str comparison errors
-    cleaned_train = X_train[col].fillna("unknown").astype(str).str.strip().str.lower()
-    cleaned_test = X_test[col].fillna("unknown").astype(str).str.strip().str.lower()
 
-    if set(cleaned_train.unique()).issubset(set(binary_map.keys()).union({"nan", "unknown"})):
-        X_train[col] = cleaned_train.map(binary_map).fillna(0).astype(int)
-        X_test[col] = cleaned_test.map(binary_map).fillna(0).astype(int)
-        category_maps[col] = binary_map
-    else:
-        # Categorical string columns (ethnicity, contry_of_res, relation)
-        uniques = sorted(list(cleaned_train.unique()))
-        mapping = {val: idx for idx, val in enumerate(uniques)}
-        X_train[col] = cleaned_train.map(mapping).fillna(0).astype(int)
-        X_test[col] = cleaned_test.map(mapping).fillna(0).astype(int)
-        category_maps[col] = mapping
+def binary(series, label, allow_words):
+    cleaned = series.astype("string").str.strip().str.lower()
+    mapped = pd.to_numeric(cleaned, errors="coerce")
+    if allow_words:
+        mapped = mapped.fillna(cleaned.map(BINARY))
+    if not mapped.isin([0, 1]).all():
+        raise ValueError(f"{label} contains missing or unrecognised values. Check the CSV encoding.")
+    return mapped.astype(int)
 
-# Feature Scaling
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
 
-# Train Random Forest Classifier
-model = RandomForestClassifier(
-    n_estimators=200, 
-    max_depth=10, 
-    class_weight="balanced", 
-    random_state=42
-)
-model.fit(X_train_scaled, y_train)
-
-print("--- EVALUATION REPORT ---")
-preds = model.predict(X_test_scaled)
-probs = model.predict_proba(X_test_scaled)[:, 1]
-
-print(classification_report(y_test, preds))
-print(f"ROC-AUC Score: {roc_auc_score(y_test, probs):.4f}")
-
-# Save Artifacts
-with open("autism_model.pkl", "wb") as f:
-    pickle.dump(
-        {
-            "model": model,
-            "scaler": scaler,
-            "feature_names": list(X_train.columns),
-            "category_maps": category_maps,
-            "age_median": age_median,
-            "classes": list(model.classes_),
-        },
-        f,
+def train(csv_path, raw_answers=False, target=None):
+    df = pd.read_csv(csv_path, encoding="utf-8-sig", na_values=["?", "null", "None"])
+    df.columns = df.columns.str.strip().str.lower()
+    df = df.rename(columns=ALIASES)
+    if df.columns.duplicated().any():
+        raise ValueError("Duplicate columns after normalisation. Check the CSV headers.")
+    targets = [k for k in ("class/asd", "class/asd traits", "class", "class/asd_traits") if k in df]
+    if target is None and len(targets) != 1:
+        raise ValueError("Specify the outcome column with --target. Do not use family history.")
+    target = target.strip().lower() if target else targets[0]
+    if target not in df or target in {*FIELDS, *ALIASES, "age", "result", *(s.lower() for s in SCORES)}:
+        raise ValueError(f"Invalid outcome column: {target!r}")
+    y = binary(df[target], target, True)
+    X = pd.DataFrame(index=df.index)
+    for i, col in enumerate(SCORES):
+        if col.lower() not in df:
+            raise ValueError(f"Missing required column {col}")
+        values = binary(df[col.lower()], col, raw_answers)
+        X[col] = values.map(lambda yes: point(i, bool(yes))) if raw_answers else values
+    if "result" in df:
+        totals = pd.to_numeric(df["result"], errors="coerce")
+        matches = totals.eq(X.sum(axis=1))
+        print(f"CSV result matches item sum on {matches.sum()}/{len(df)} rows. "
+              "If result is the documented item total, investigate any mismatch before use.")
+    counts = y.value_counts()
+    if len(counts) != 2 or counts.min() < 2 or len(y) < 6:
+        raise ValueError("Need enough examples of both classes for an 80/20 stratified split.")
+    train_x, test_x, train_y, test_y = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
     )
+    if min(train_y.nunique(), test_y.nunique()) < 2:
+        raise ValueError("Both classes must appear in training and evaluation. Add minority examples.")
 
-print("✅ Saved robust model pipeline to 'autism_model.pkl' successfully!")
+    # Background controls use training-only metadata. The forest sees only item points.
+    background = df.loc[train_x.index]
+    age_default = None
+    if "age" in background:
+        ages = pd.to_numeric(background["age"], errors="coerce").dropna()
+        if not ages.empty:
+            age_default = float(ages.median())
+    maps = {}
+    for col in FIELDS:
+        if col in background:
+            values = background[col].dropna().astype(str).str.strip().str.lower()
+            maps[col] = {v: i for i, v in enumerate(sorted(set(values) - {""}))}
+    model = RandomForestClassifier(n_estimators=200, max_depth=10, class_weight="balanced", random_state=42)
+    model.fit(train_x, train_y)
+    pred = model.predict(test_x)
+    pos = list(model.classes_).index(1)
+    auc = roc_auc_score(test_y, model.predict_proba(test_x)[:, pos])
+    report = classification_report(test_y, pred, labels=[0, 1], zero_division=0)
+    tn, fp, fn, tp = confusion_matrix(test_y, pred, labels=[0, 1]).ravel()
+    print(report, f"ROC-AUC: {auc:.3f}; missed positive labels: {fn}/{fn + tp}")
+    return dict(version=VERSION, model=model, features=list(train_x.columns), maps=maps,
+                age_default=age_default, auc=auc, report=report, confusion=[[tn, fp], [fn, tp]])
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--csv", type=Path, default=ROOT / "autism_data.csv")
+    parser.add_argument("--target", help="Explicit binary outcome header if not recognised")
+    parser.add_argument("--raw-answers", action="store_true",
+                        help="Only for raw adult item responses where 1 means Yes and 0 means No")
+    args = parser.parse_args()
+    bundle = train(args.csv, args.raw_answers, args.target)
+    with NamedTemporaryFile(dir=ROOT, delete=False) as tmp:
+        pickle.dump(bundle, tmp)
+    Path(tmp.name).replace(MODEL_PATH)
+    print(f"Saved {MODEL_PATH}")

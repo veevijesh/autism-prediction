@@ -1,97 +1,132 @@
+"""Start with: python -m streamlit run app.py"""
 import pickle
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Autism Spectrum Screening Tool", page_icon="🧠", layout="wide")
+from main import FIELDS, ITEMS, MODEL_PATH, SCORES, VERSION, point
 
-st.title("🧠 Autism Spectrum Trait Screening Tool")
-st.write(
-    "A preliminary screening demo based on the AQ-10 questionnaire. The model is a Logistic "
-    "Regression trained on 800 labeled adult respondents (Kaggle Autism Prediction dataset)."
-)
-st.info(
-    "⚠️ Educational screening demonstration for adults (18+). It does not replace a clinical diagnosis."
-)
+st.set_page_config(page_title="Adult questionnaire explorer", layout="wide")
+st.title("Adult autism questionnaire explorer")
+st.write("Educational demonstration using adapted yes/no questions. This questionnaire "
+         "cannot diagnose autism or rule it out.")
 
 
 @st.cache_resource
-def load_bundle():
-    with open("autism_model_v2.pkl", "rb") as f:
-        return pickle.load(f)
+def load_bundle(path, stamp):
+    # The file timestamp is part of the cache key so retraining reloads the model.
+    with path.open("rb") as stream:
+        return pickle.load(stream)
 
 
-bundle = load_bundle()
-pipeline = bundle["pipeline"]
-features = bundle["features"]
-
-questions = {
-    "A1_Score": "A1. Do you easily notice small sounds or details that others miss?",
-    "A2_Score": "A2. Do you usually concentrate more on the whole picture rather than small details?",
-    "A3_Score": "A3. Do you find it easy to do more than one task at the same time?",
-    "A4_Score": "A4. If there is an interruption, can you switch back to what you were doing easily?",
-    "A5_Score": "A5. Do you find it easy to 'read between the lines' when someone is talking?",
-    "A6_Score": "A6. Do you know how to tell if someone listening to you is getting bored?",
-    "A7_Score": "A7. When reading a story, do you find it difficult to work out characters' intentions?",
-    "A8_Score": "A8. Do you like to collect information about categories of things (e.g., cars, birds, plants)?",
-    "A9_Score": "A9. Do you find it easy to understand what someone is feeling just by looking at their face?",
-    "A10_Score": "A10. Do you find it difficult to make new friends?",
-}
-
-# AQ-10 scoring key: a point is earned by "Yes" on these questions and by "No" on the rest
-yes_earns_point = ["A1_Score", "A7_Score", "A8_Score", "A10_Score"]
-
-tab1, tab2 = st.tabs(["📋 Screening Questionnaire", "📊 Model Insights"])
-
-with tab1:
-    st.subheader("AQ-10 Screening Questionnaire")
-    scores = {}
-    for col, text in questions.items():
-        choice = st.selectbox(text, options=["No", "Yes"], key=col)
-        if col in yes_earns_point:
-            scores[col] = 1 if choice == "Yes" else 0
-        else:
-            scores[col] = 1 if choice == "No" else 0
-
-    if st.button("Predict ASD Trait Likelihood", type="primary"):
-        x_new = pd.DataFrame([scores])[features]
-        prob = pipeline.predict_proba(x_new)[0][1] * 100
-        prediction = int(pipeline.predict(x_new)[0])
-        points = sum(scores.values())
-
-        st.markdown("---")
-        if prediction == 1:
-            st.error(f"**Higher likelihood of ASD traits** (model score: {prob:.1f}%)")
-        else:
-            st.success(f"**Lower likelihood of ASD traits** (model score: {prob:.1f}%)")
-        st.write(f"AQ-10 points earned: **{points} out of 10**")
-        st.caption(
-            "The model score is the output of a Logistic Regression and is not a clinical "
-            "probability. A higher score means the answers resemble those of respondents "
-            "labeled positive in the training data."
-        )
-
-with tab2:
-    st.subheader("What the model relies on")
-    coefs = pipeline.named_steps["model"].coef_[0]
-    coef_df = pd.DataFrame({"Question": features, "Weight": coefs}).sort_values(
-        "Weight", ascending=False
-    )
-    st.caption("A larger positive weight means a point on that question pushes the score up more.")
-    st.bar_chart(coef_df.set_index("Question"))
-    st.dataframe(coef_df)
-
-    st.subheader("Cross-validated performance")
+def show_contributions(model, row, positive_index):
     try:
-        res = pd.read_csv("results.csv")
-        row = res[
-            (res["Features"] == "Questionnaire only (10)")
-            & (res["Model"] == "Logistic Regression")
-        ]
-        st.dataframe(row)
-        st.write(
-            "5-fold stratified cross-validation on 800 respondents. "
-            "See the Model Comparison page for all models and feature sets."
-        )
-    except FileNotFoundError:
-        st.write("Run experiments.py to generate results.csv.")
+        import shap
+    except ImportError:
+        st.info("Install shap to view the per-answer model explanation.")
+        return
+    raw = shap.TreeExplainer(model).shap_values(row)
+    if isinstance(raw, list):  # Older SHAP versions return one array per class.
+        values = raw[positive_index][0]
+    elif np.ndim(raw) == 3:
+        values = raw[0, :, positive_index]
+    else:
+        st.info("This SHAP version did not return class-specific contributions.")
+        return
+    contributions = pd.Series(values, index=row.columns, name="Contribution")
+    st.caption("Positive contributions raise the model output for label 1 relative to its baseline.")
+    st.bar_chart(contributions.sort_values().to_frame())
+
+
+bundle = None
+stamp = None
+try:
+    stamp = MODEL_PATH.stat().st_mtime_ns
+    loaded = load_bundle(MODEL_PATH, stamp)
+    if isinstance(loaded, dict) and loaded.get("version") == VERSION:
+        bundle = loaded
+    else:
+        st.warning("Old model format. Run python main.py --csv train.csv to enable the model tabs.")
+except FileNotFoundError:
+    st.info("The questionnaire works now. Run python main.py --csv train.csv to enable the model tabs.")
+except (ImportError, AttributeError, EOFError, ValueError, pickle.UnpicklingError):
+    st.warning("Could not load this model. Rebuild it with python main.py --csv train.csv in this environment.")
+
+assessment, explanation, analytics = st.tabs(["Questionnaire", "Model explanation", "Model analytics"])
+with assessment:
+    # Start with a complete input record. Item defaults are overwritten on valid submission.
+    inputs = dict.fromkeys(SCORES, 0)
+    if bundle:
+        inputs.update(dict.fromkeys(bundle["maps"], -1))
+        if bundle["age_default"] is not None:
+            inputs["age"] = float(bundle["age_default"])
+
+    choices = []
+    for i, (question, _) in enumerate(ITEMS):
+        choices.append(st.selectbox(f"{i + 1}. {question}", ["Choose an answer", "Yes", "No"], key=SCORES[i]))
+    if bundle and ("age" in inputs or bundle["maps"]):
+        with st.expander("Optional background"):
+            st.caption("Background information is excluded from both the score and the model.")
+            if "age" in inputs:
+                inputs["age"] = st.number_input("Age in years", min_value=0.0, step=1.0,
+                                                value=max(0.0, inputs["age"]))
+                st.caption("Defaults to the median age in the training split.")
+            for col, mapping in bundle["maps"].items():
+                value = st.selectbox(FIELDS[col], [None, *mapping],
+                                     format_func=lambda v: "Unspecified" if v is None else str(v),
+                                     key=col)
+                inputs[col] = mapping.get(value, -1)
+
+    if st.button("Show my results", type="primary"):
+        if "Choose an answer" in choices:
+            st.warning("Please answer all ten questions.")
+        else:
+            points = [point(i, choice == "Yes") for i, choice in enumerate(choices)]
+            inputs.update(zip(SCORES, points))
+            st.session_state["last_submission"] = {
+                "choices": choices.copy(), "inputs": inputs.copy(), "points": points.copy()
+            }
+
+    submitted = st.session_state.get("last_submission")
+    if submitted:
+        points = submitted["points"]
+        st.subheader("Last submitted results")
+        st.caption("After editing an answer, select Show my results again to update these results.")
+        st.metric("Answers scoring one point", f"{sum(points)} / 10")
+        st.caption("This count describes the answers you gave. It is separate from the model output. "
+                   "If you have concerns, you can discuss them with a qualified clinician at any score.")
+        st.dataframe(pd.DataFrame({"Question": SCORES, "Answer": submitted["choices"], "Point": points}),
+                     hide_index=True)
+        if bundle:
+            st.write("Open Model explanation to see how the trained model classified these answers.")
+
+with explanation:
+    if not bundle:
+        st.info("A freshly trained model is required for this tab.")
+    elif not submitted:
+        st.info("Complete and submit the current questionnaire first.")
+    else:
+        model = bundle["model"]
+        row = pd.DataFrame([submitted["inputs"]], columns=bundle["features"])
+        pos = list(model.classes_).index(1)
+        output = model.predict_proba(row)[0, pos]
+        label = model.predict(row)[0]
+        st.metric("Predicted dataset label", str(label))
+        st.write(f"Model output for the positive dataset label: {output:.1%}.")
+        st.caption("This estimates agreement with the training labels. It is not a person's probability of autism.")
+        st.subheader("What influenced this model prediction?")
+        show_contributions(model, row, pos)
+
+with analytics:
+    if bundle:
+        st.subheader("Held-out evaluation against the CSV labels")
+        st.metric("ROC-AUC", f"{bundle['auc']:.3f}")
+        st.code(bundle["report"])
+        st.dataframe(pd.DataFrame(bundle["confusion"], index=["Actual 0", "Actual 1"],
+                                  columns=["Predicted 0", "Predicted 1"]))
+        st.subheader("Global feature importance")
+        st.bar_chart(pd.Series(bundle["model"].feature_importances_, index=bundle["features"],
+                               name="Importance").sort_values(ascending=False).to_frame())
+    else:
+        st.info("Train the model to see its held-out evaluation.")
